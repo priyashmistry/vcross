@@ -1,0 +1,1844 @@
+#!/usr/bin/env python3
+#!/Users/z5517274/anaconda3/bin/python3
+
+# Setup
+# mkdir -p ~/bin && chmod +x ~/bin/vcross && grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc && export PATH="$HOME/bin:$PATH"
+
+# Setup to use calibration files i.e., mask1_LC_4.fits & mask1_TH_4.fits
+# First set the variable (Local System):
+# export VELOCEDR_CAL_FILES="/Users/z5517274/bin/VeloceDR/cal_files"
+# For Katana ssh:
+# export VELOCEDR_CAL_FILES="/home/z5517274/bin/VeloceDR/cal_files"
+
+
+# Then run:
+# vcross [-p] [-l] [-v] [-cal] [--mask1_threshold 6000] [--mask2_threshold 4000] [--qm_qn_cfs [0,None,None,None,None]] [--skip q1_q2,q2_q1,q3_q1,q3_q2,q4_q2,q4_q1] [if -l then path to .txt] [path to *o.fits files or list of *o.fits files]
+
+# --------------------------------------------------- #
+#                 Importing Libraries                 #
+# --------------------------------------------------- #
+# === Standard Library Imports ===
+import argparse
+import psutil
+import builtins
+import cProfile
+import csv
+import logging
+import logging.handlers
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import subprocess
+import stat
+from ast import literal_eval
+from datetime import datetime
+from decimal import Decimal
+from multiprocessing import Process, current_process
+import multiprocessing
+import warnings
+
+# === Third-Party Imports ===
+import matplotlib.pyplot as plt
+import numpy as np
+import pyfiglet
+from astropy.io import fits
+from astropy.visualization import astropy_mpl_style
+from scipy import stats
+from scipy.ndimage import (
+    binary_dilation,
+    find_objects,
+    generate_binary_structure,
+    label
+)
+from scipy.optimize import curve_fit
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.mixture import GaussianMixture
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+# === Concurrency Imports ===
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+# === File Handling ===
+import glob
+
+# === Global Declarations ===
+global COMMAND
+global VERSION
+global THIS
+global USAGE
+global VERBOSE
+
+
+# --------------------------------------------------- #
+#     vcross: Calibration File Path Configuration     #
+# --------------------------------------------------- #
+"""
+This module sets up paths for the `vcross` tool (version 1.1), specifically for locating
+calibration files required by the Veloce Data Reduction (VeloceDR) pipeline. It checks for
+an environment variable override and falls back to a default path relative to the script
+location.
+
+Constants:
+    COMMAND (str): Name of the command-line tool.
+    VERSION (str): Version string of the tool.
+    THIS (str): Combined identifier of the command and version.
+    SCRIPT_DIR (str): Absolute directory path of the current script.
+    CAL_FILES_DIR (str): Path to calibration files, determined by environment or default.
+
+Environment Variables:
+    VELOCEDR_CAL_FILES: If set, overrides the default calibration files path.
+"""
+# Constants for the tool's name and version
+COMMAND = "vcross"
+VERSION = "1.1"
+
+# Combined identifier for logging or display purposes
+THIS = COMMAND + '-' + VERSION + ':'
+
+# Absolute path to the directory where this script resides
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Attempt to get calibration file path from an environment variable
+CAL_FILES_DIR = os.environ.get("VELOCEDR_CAL_FILES")
+
+# If not set, use the default path relative to the script's location
+if CAL_FILES_DIR is None:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    CAL_FILES_DIR = os.path.join(SCRIPT_DIR, 'VeloceDR', 'cal_files')
+
+
+# --------------------------------------------------- #
+#                     Logging                         #
+# --------------------------------------------------- #
+def get_timestamped_log_name():
+    """
+    Generate a log file name with a timestamp.
+
+    Returns:
+        str: A log file name in the format 'vcross_DDMMYYYY_HHMMSS.log'.
+    """
+    now = datetime.now().strftime("%d%m%Y_%H%M%S")
+    return f"vcross_{now}.log"
+
+def setup_logger(log_file):
+    """
+    Set up a logger that writes to both a file and the console.
+
+    The logger is uniquely identified by the current process ID, making it
+    suitable for multiprocessing environments. The log format excludes the
+    process name for clarity.
+
+    Args:
+        log_file (str): Path to the log file to write to.
+
+    Returns:
+        logging.Logger: Configured logger instance.
+    """
+    logger = logging.getLogger(str(os.getpid()))
+    logger.setLevel(logging.INFO)
+    
+    # Remove processName from format
+    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+
+    # File Handler
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    # Stream Handler (to terminal)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+    return logger
+
+
+# --------------------------------------------------- #
+#              Suppress RuntimeWarnings               #
+# --------------------------------------------------- #
+"""
+Runtime Warning and Output Suppression
+
+This section configures the plotting style using Astropy's Matplotlib theme,
+suppresses runtime and specific Astropy FITS header warnings, and temporarily
+redirects standard error to suppress noisy library output.
+
+Suppressions:
+    - RuntimeWarnings globally (e.g., division by zero in NumPy)
+    - UserWarnings specifically from `astropy.io.fits.card`
+    - All `stderr` output (e.g., C-library prints) redirected to /dev/null
+"""
+# Apply Astropy's standard Matplotlib plotting style
+plt.style.use(astropy_mpl_style)
+
+# Suppress all RuntimeWarnings (e.g., from numerical operations)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# Suppress specific UserWarnings from Astropy about non-standard FITS headers
+warnings.filterwarnings("ignore", category=UserWarning, module='astropy.io.fits.card')
+
+# Redirect stderr to suppress warnings/errors printed directly to stderr (e.g., by compiled extensions)
+sys.stderr = open(os.devnull, 'w')
+
+
+# --------------------------------------------------- #
+#                      Files I/O                      #
+# --------------------------------------------------- #
+
+def load_fits_image(file_path, logger):
+    """
+    Load image data from a FITS file.
+
+    Attempts to read the primary HDU (extension 0) from a FITS file. Logs an error
+    message and re-raises the exception if the file cannot be read.
+
+    Args:
+        file_path (str): Path to the FITS file.
+        logger (logging.Logger): Logger instance used to report errors.
+
+    Returns:
+        numpy.ndarray: The image data loaded from the FITS file.
+
+    Raises:
+        Exception: If the file cannot be opened or read.
+    """
+    try:
+        return fits.getdata(file_path, ext=0)
+    except Exception as e:
+        logger.error(f"{THIS} Failed to load FITS file '{file_path}': {e}")
+        raise
+        
+def save_multi_extension_fits(corrected_data, mask_data, save_path, logger):
+    """
+    Save two arrays into a multi-extension FITS file.
+
+    This function creates a FITS file with two extensions:
+    - The primary HDU contains the `corrected_data`.
+    - A secondary ImageHDU contains the `mask_data`.
+
+    The file is saved to the specified path, overwriting any existing file.
+    Errors are logged and then re-raised.
+
+    Args:
+        corrected_data (numpy.ndarray): The primary image data to be saved.
+        mask_data (numpy.ndarray): The secondary image data to be saved in an extension.
+        save_path (str): Path where the FITS file will be written.
+        logger (logging.Logger): Logger instance used to report errors.
+
+    Raises:
+        Exception: If the file cannot be written.
+    """
+    try:
+        # Create Primary HDU with corrected data
+        primary_hdu = fits.PrimaryHDU(corrected_data)
+
+        # Create secondary ImageHDU for additional image data
+        second_hdu = fits.ImageHDU(mask_data)
+
+        # Combine both HDUs into a single FITS file
+        hdulist = fits.HDUList([primary_hdu, second_hdu])
+
+        # Write the file, allowing overwrite if the file already exists
+        hdulist.writeto(save_path, overwrite=True)
+        
+        logger.info(f"{THIS} File is corrected an saved to '{save_path}'")
+
+    except Exception as e:
+        logger.error(f"{THIS} Failed to save FITS to '{save_path}': {e}")
+        raise       
+        
+def get_files_from_input(input_paths, l, logger):
+    """
+    Extract a list of valid FITS files matching '*o.fits' from various input formats.
+
+    Handles multiple input styles:
+        1. Directories — collects all matching files.
+        2. Text files — treated as file lists if `is_list_file` is True.
+        3. Individual FITS files — directly added if valid.
+        4. Brace expansion syntax — expands and validates.
+
+    Args:
+        input_paths (list[str]): List of file paths, directories, or list files.
+        l (bool): Interpret `.txt` files as lists of relative file names.
+        logger (logging.Logger): Logger for reporting info and warnings.
+
+    Returns:
+        list[str]: Sorted list of valid FITS file paths ending in 'o.fits'.
+    """
+    valid_files = []
+
+    for input_path in input_paths:
+        # 1. Directory: collect all '*o.fits' files
+        if os.path.isdir(input_path):
+            matched = glob.glob(os.path.join(input_path, '*o.fits'))
+            logger.info(f"{THIS} Found {len(matched)} FITS files in directory: {input_path}")
+            valid_files.extend(matched)
+            continue
+
+        # 2. Text file list: only if explicitly requested
+        if l and os.path.isfile(input_path):
+            base_dir = os.path.dirname(input_path)
+            try:
+                with open(input_path, 'r') as f:
+                    lines = [line.strip() for line in f if line.strip().endswith("o.fits")]
+                full_paths = [os.path.join(base_dir, line) for line in lines]
+                found = [fp for fp in full_paths if os.path.isfile(fp)]
+                logger.info(f"{THIS} Loaded {len(found)} FITS files from list file: {input_path}")
+                if len(found) < len(lines):
+                    logger.warning(f"{THIS} Some listed files not found or invalid in: {input_path}")
+                valid_files.extend(found)
+            except Exception as e:
+                logger.error(f"{THIS} Failed to read list file '{input_path}': {e}")
+            continue
+
+        # 3. Single file: valid and ends with 'o.fits'
+        if input_path.endswith('o.fits') and os.path.isfile(input_path):
+            logger.info(f"{THIS} Found valid FITS file: {input_path}")
+            valid_files.append(input_path)
+            continue
+
+        # 4. Brace expansion: e.g., 'dir/{f1o.fits,f2o.fits}'
+        if "{" in input_path and "}" in input_path:
+            try:
+                brace_start = input_path.find("{")
+                brace_end = input_path.find("}")
+                base_path = input_path[:brace_start]
+                file_list_str = input_path[brace_start + 1:brace_end]
+                file_names = [f.strip() for f in file_list_str.split(",")]
+                full_paths = [os.path.join(base_path, fname) for fname in file_names]
+                matched = [f for f in full_paths if f.endswith("o.fits") and os.path.isfile(f)]
+                logger.info(f"{THIS} Expanded brace pattern into {len(matched)} valid files: {input_path}")
+                valid_files.extend(matched)
+            except Exception as e:
+                logger.error(f"{THIS} Failed to parse brace expansion in '{input_path}': {e}")
+            continue
+
+        # 5. Unknown or invalid input
+        logger.warning(f"{THIS} Ignoring invalid or unrecognized input: {input_path}")
+
+    unique_sorted_files = sorted(set(valid_files))
+    logger.info(f"{THIS} Total unique FITS files collected: {len(unique_sorted_files)}")
+    return unique_sorted_files
+        
+def write_to_csv(fits_file, loc, data, suffixes, csv_file, headers, logger):
+    """
+    Append or update a CSV file with data derived from a FITS file.
+
+    Ensures:
+        - Column order matches `headers`
+        - Existing entries (by UTMJD) are updated
+        - New entries are added if not found
+        - Missing columns are filled with "-"
+
+    Args:
+        fits_file (str): Path to the FITS file for metadata extraction.
+        loc (str): Location string used to prefix suffixes for column names.
+        data (dict): Dictionary of data values to write into the CSV.
+        suffixes (list[str]): Suffixes appended to the formatted location for column keys.
+        csv_file (str): Path to the CSV file.
+        headers (list[str]): List of all expected CSV column headers.
+        logger (logging.Logger): Logger instance for messages and error reporting.
+
+    Returns:
+        None
+    """
+    try:
+        # Extract metadata from FITS header
+        utmjd, fileorig = extract_fits_headers(fits_file, logger)
+        loc_formatted = convert_loc_to_q_format(loc)
+        q_headers = [f"{loc_formatted}_{suffix}" for suffix in suffixes]
+
+        # Create CSV if missing
+        if not os.path.exists(csv_file):
+            with open(csv_file, 'w', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=headers)
+                writer.writeheader()
+            logger.info(f"{THIS} Created new CSV file: {csv_file}")
+
+        # Read existing records and update if matching UTMJD found
+        records = []
+        file_updated = False
+        with open(csv_file, mode='r') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                if float(row.get("UTMJD", -1)) == utmjd:
+                    # Update matching row
+                    row["UTMJD"] = utmjd
+                    for key, value in data.items():
+                        row[key] = str(value)
+                    file_updated = True
+                    logger.info(f"{THIS} Updated row for file: {fileorig}")
+                records.append(row)
+
+        # Append new row if no match was found
+        if not file_updated:
+            new_row = {header: "-" for header in headers}
+            new_row.update({"UTMJD": utmjd, "FILEORIG": fileorig})
+            for key, value in data.items():
+                new_row[key] = str(value)
+            records.append(new_row)
+            logger.info(f"{THIS} Added new row for file: {fileorig}")
+
+        # Sort records by UTMJD time
+        records.sort(key=lambda x: float(x["UTMJD"]))
+
+        # Write back to file
+        with open(csv_file, mode='w', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(records)
+
+    except Exception as e:
+        logger.error(f"{THIS} Failed to write to CSV '{csv_file}': {e}")
+
+        
+# --------------------------------------------------- #
+#             Get File Details to Process             #
+# --------------------------------------------------- #        
+def extract_fits_headers(fits_file, logger):
+    """
+    Extract the UTMJD (epoch) and FILEORIG (original filename) from a FITS file header.
+
+    Args:
+        fits_file (str): Path to the FITS file to read.
+        logger (logging.Logger): Logger instance for logging messages and errors.
+
+    Returns:
+        tuple: A tuple (utmjd, fileorig) where:
+            - utmjd (float): Modified Julian Date from the FITS header.
+            - fileorig (str): Filename stored in the FITS metadata.
+
+    Raises:
+        KeyError: If required header keys are missing.
+        Exception: For any I/O or FITS parsing errors.
+    """
+    try:
+        with fits.open(fits_file, memmap=True) as hdul:
+            header = hdul[0].header
+
+            utmjd = float(header["UTMJD"])
+            fileorig = os.path.basename(header["FILEORIG"].strip())
+ 
+            return utmjd, fileorig
+
+    except KeyError as e:
+        logger.error(f"{THIS} Missing required FITS header in {fits_file}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"{THIS} Error reading FITS headers from {fits_file}: {e}")
+        raise
+    
+def check_lfc_lines(fits_file, logger=None):
+    """
+    Check if the FITS file indicates an LFC (Laser Frequency Comb) source.
+
+    This is determined by checking whether the header contains either:
+        - VIDSLCR == 1 (red arm)
+        - VIDSLCB == 1 (blue arm)
+
+    Args:
+        fits_file (str): Path to the FITS file to inspect.
+        logger (logging.Logger, optional): Logger instance for diagnostics.
+
+    Returns:
+        bool: True if either VIDSLCR or VIDSLCB is set to 1, otherwise False.
+    """
+    try:
+        with fits.open(fits_file, memmap=True) as hdul:
+            header = hdul[0].header
+            is_lfc = header.get("VIDSLCR", 0) == 1 or header.get("VIDSLCB", 0) == 1
+            
+            if logger:
+                logger.info(f"{THIS} LFC check for {os.path.basename(fits_file)}: {is_lfc}")
+            
+            return is_lfc
+
+    except Exception as e:
+        if logger:
+            logger.error(f"{THIS} Failed to read FITS header for LFC check: {e}")
+        return False
+
+
+# --------------------------------------------------- #
+#              Optimal Batch Processing               #
+# --------------------------------------------------- #
+def get_optimal_max_files():
+    """
+    Determine the optimal number of parallel files to process.
+
+    This function uses available CPU cores and RAM to make an informed guess
+    about how many files can be processed in parallel efficiently.
+
+    Strategy:
+        - Starts with half of total CPU cores.
+        - Reduces that number if available RAM is low (<8 GB).
+        - Increases that number if RAM is abundant (>16 GB), up to the CPU core count.
+
+    Returns:
+        int: Recommended maximum number of files to process concurrently.
+    """
+    total_cores = os.cpu_count() or 8  # Fallback to 8 if None
+    available_memory = psutil.virtual_memory().available / (1024 ** 3)  # Convert bytes to GB
+    
+    # Start with a baseline: half of CPU cores
+    max_files = max(2, total_cores // 2)  
+
+    # Adjust based on available RAM
+    if available_memory < 8:
+        max_files = max(2, max_files - 2)  # Reduce if RAM is low
+    elif available_memory > 16:
+        max_files = min(max_files + 4, total_cores)  # Increase if RAM is abundant
+
+    return max_files
+
+def get_optimal_workers():
+    """
+    Estimate an optimal number of worker processes based on CPU and memory.
+
+    Strategy:
+        - Start with a cap of 8 or the number of CPU cores, whichever is lower.
+        - Reduce worker count if available RAM is below 8 GB.
+        - Ensure a minimum of 2 workers to maintain concurrency.
+
+    Returns:
+        int: Recommended number of worker processes.
+    """
+    total_cores = os.cpu_count()
+    available_memory = psutil.virtual_memory().available / (1024 ** 3)  # Convert to GB
+    recommended_workers = min(total_cores, 8)  # Don't exceed total cores
+
+    # Adjust based on available RAM
+    if available_memory < 8:
+        recommended_workers = max(4, recommended_workers - 2)
+    
+    return recommended_workers
+
+def process_files_in_batches(files, args, log_dir=None):
+    """
+    Process a list of FITS files in parallel, in batches, using a process pool.
+
+    This function splits the input files into manageable batches based on available
+    system resources (CPU and memory), then processes each batch concurrently.
+
+    Args:
+        files (list of str): List of FITS file paths to process.
+        args (Namespace): Parsed command-line arguments containing processing parameters.
+        log_dir (str, optional): Directory to save temporary log files. Created if not existing.
+
+    Returns:
+        str: Path to the temporary log directory, for further use (e.g., log merging).
+    """
+    MAX = get_optimal_max_files()
+    temp_log_dir = log_dir or "temp_logs"
+    os.makedirs(temp_log_dir, exist_ok=True)
+
+    for i in range(0, len(files), MAX):
+        batch = files[i: i + MAX]
+        print(f"{THIS} Processing batch {i // MAX + 1}: {len(batch)} file(s)...")
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=get_optimal_workers()
+        ) as executor:
+            futures = [
+                executor.submit(
+                    process_file,
+                    args.p, args.l, args.v, args.cal,
+                    args.mask1_threshold, args.mask2_threshold,
+                    args.q4_q1_cfs, args.q4_q2_cfs,
+                    args.q3_q2_cfs, args.q3_q1_cfs,
+                    args.q2_q1_cfs, args.q1_q2_cfs,
+                    args.skip, image_file,
+                    temp_log_dir
+                )
+                for image_file in batch
+            ]
+            concurrent.futures.wait(futures)
+
+    return temp_log_dir
+
+
+# --------------------------------------------------- #
+#                    Pre-Processing                   #
+# --------------------------------------------------- #                        
+def convert_loc_to_q_format(loc):
+    """
+    Convert a quadrant-pair location string like '4_1' into 'Q4_Q1'.
+
+    Args:
+        loc (str): Location string in the format 'X_Y', e.g., '4_1'.
+
+    Returns:
+        str: Converted location string in the format 'QX_QY', e.g., 'Q4_Q1'.
+    """
+    parts = loc.split('_')
+    return f"Q{parts[0]}_Q{parts[1]}"
+    
+def get_source_mask(array, lower_lim, sat_lim = 60000, size_lim = 50):
+    """
+    Generate a binary mask identifying significant sources in a 2D image array.
+
+    The function detects saturated pixels, grows them into source regions by 
+    dilation based on a lower brightness threshold, and filters out small noisy regions.
+
+    Args:
+        array (np.ndarray): 2D image data of a source quadrant, either Q1 or Q2.
+        lower_lim (float): Pixel intensity threshold to include in growing regions.
+        sat_lim (float, optional): Saturation threshold to seed source detection. Default is 60000.
+        size_lim (int, optional): Minimum size (in pixels) for regions to be retained. Default is 50.
+
+    Returns:
+        np.ndarray: Boolean mask of the same shape as given quadrant with `True` for detected source pixels.
+    """
+    
+    # Step 1: Select pixels greater than given sat_lim
+    type1_pixels = array > sat_lim
+    
+    # Step 2: Find connected regions
+    structure = generate_binary_structure(2, 1)
+    labeled_array, num_features = label(type1_pixels, structure)
+
+    # Step 3: Initialize mask for pixels above lower_lim
+    final_mask = np.zeros_like(array, dtype=bool)
+    old_mask = np.zeros_like(array, dtype=bool)
+
+    # Repeat until no new pixels are selected
+    while True:
+        new_mask = np.zeros_like(array, dtype=bool)
+        for label_value in range(1, num_features + 1):
+            # Select pixels of current label
+            current_label_mask = labeled_array == label_value
+            # Check if any pixel in the region is > 23000
+            if np.any(array[current_label_mask] > lower_lim):
+                # Dilate the current region and set pixels above 23000 to True
+                dilated_label = binary_dilation(current_label_mask, structure)
+                new_mask[dilated_label] = array[dilated_label] > lower_lim
+
+        # Update the final mask with the new selection
+        final_mask |= new_mask
+        
+        # Update the labeled array with the new selection
+        labeled_array, num_features = label(final_mask, structure)
+
+        # Check if the new mask is the same as the old mask
+        if np.array_equal(new_mask, old_mask):
+            break
+
+        # Update the old mask
+        old_mask = np.copy(new_mask)
+    
+    # Step 4: Remove small groups of pixels
+    binary_mask = final_mask
+
+    # Size threshold to remove small groups of pixels
+    size_threshold = size_lim  # Adjust as needed
+
+    # Label the connected components in the binary mask
+    structure = generate_binary_structure(2, 1)  # 8-connectivity
+    labeled_array, num_features = label(binary_mask, structure)
+
+    # Measure the size of each connected component
+    component_sizes = np.bincount(labeled_array.ravel())
+
+    # Create a mask to keep only components larger than the size threshold
+    large_component_mask = np.zeros_like(binary_mask, dtype=bool)
+    for i in range(1, num_features + 1):
+        if component_sizes[i] >= size_threshold:
+            large_component_mask[labeled_array == i] = True
+    
+    # Step 5: Update the final mask
+    final_mask = large_component_mask
+    
+    return final_mask
+
+# --------------------------------------------------- #
+#                     Correction                      #
+# --------------------------------------------------- # 
+def apply_random_forest_with_bounding_boxes(loc_data, ct, shifter_value, bounding_boxes, threshold = 160):
+    """
+    Applies a Random Forest model to detrend data in specified bounding boxes 
+    and smooths predictions using Lowess, adjusting values based on a given threshold.
+
+    Args:
+        loc_data (np.ndarray): 2D array containing the locations to be corrected.
+        ct (np.ndarray): 2D array to apply corrections to.
+        shifter_value (float): A value added to the detrended data for shifting.
+        bounding_boxes (List[Tuple[Tuple[int, int], Tuple[int, int]]]): List of bounding boxes, 
+        which are enclosing the cross-talk region, where each box is defined by two tuples
+        (row_start, row_end) and (col_start, col_end).
+        threshold (float, optional): Ignore pixels with a value greater than some threshold. Defaults to 160.
+
+    Returns:
+        np.ndarray: Quadrant with corrected Type I cross-talk.
+    """
+    best_fit_models = []
+
+    for bbox in bounding_boxes:
+        row_start, row_end = bbox[0]
+        col_start, col_end = bbox[1]
+
+        # Ensure the bounding box coordinates are within array dimensions
+        row_end = min(row_end, loc_data.shape[0])
+        col_end = min(col_end, loc_data.shape[1])
+
+        for i in range(col_start, col_end):
+            column_data = loc_data[row_start:row_end, i]
+            non_zero_indices = np.nonzero(column_data)[0]
+            non_zero_data = column_data[non_zero_indices]
+            
+            # Split data into below and above threshold
+            below_threshold_indices = non_zero_indices[non_zero_data <= threshold]
+            below_threshold_data = non_zero_data[non_zero_data <= threshold]
+
+            above_threshold_indices = non_zero_indices[non_zero_data > threshold]
+            above_threshold_data = non_zero_data[non_zero_data > threshold]
+
+            if len(below_threshold_indices) == 0:
+                continue
+
+            X = below_threshold_indices.reshape(-1, 1)
+            y = below_threshold_data
+
+            # Train the RandomForest model only on data below the threshold
+            rf = RandomForestRegressor(n_estimators=10000)
+            rf.fit(X, y)
+
+            # Predict for both below and above threshold data
+            y_rf_pred_below = rf.predict(below_threshold_indices.reshape(-1, 1))
+            y_rf_pred_above = rf.predict(above_threshold_indices.reshape(-1, 1)) if len(above_threshold_indices) > 0 else []
+
+            # Apply Lowess smoothing to predictions
+            smoothed_below = lowess(y_rf_pred_below, below_threshold_indices, frac=0.1)
+            smoothed_above = lowess(y_rf_pred_above, above_threshold_indices, frac=0.1) if len(above_threshold_indices) > 0 else []
+
+            best_fit_models.append({
+                'column': i,
+                'random_forest': rf,
+                'lowess_below': smoothed_below[:, 1],
+                'lowess_above': smoothed_above[:, 1] if len(smoothed_above) > 0 else []
+            })
+
+            # Apply correction to both below and above threshold data
+            shifted_detrended_column_below = below_threshold_data - smoothed_below[:, 1] + shifter_value
+            shifted_detrended_column_above = above_threshold_data - smoothed_above[:, 1] + shifter_value if len(smoothed_above) > 0 else above_threshold_data - y_rf_pred_above + shifter_value
+
+            # Update the array with corrected values
+            ct[row_start:row_end, i][below_threshold_indices] = shifted_detrended_column_below
+            if len(above_threshold_indices) > 0:
+                ct[row_start:row_end, i][above_threshold_indices] = shifted_detrended_column_above
+
+    return ct
+
+def make_correction(ct, loc_data, source, separation_point, m_2, c_2, m_3, c_3, logger):
+    """
+    Applies a correction to the input `array` based on the `source` and `loc_data` arrays.
+    The correction differs depending on whether values in the `array` are above or below the `separation_point`.
+
+    Args:
+        array (np.ndarray): The array to apply the correction to.
+        loc_data (np.ndarray): 2D array containing the locations to be corrected.
+        source (np.ndarray): The source data array used to calculate the correction.
+        separation_point (float): The threshold value to separate Type II and Type III pixels.
+        m_2 (float): The slope for the correction in Type II.
+        c_2 (float): The intercept for the correction in Type II.
+        m_3 (float): The slope for the correction in Type III.
+        c_3 (float): The intercept for the correction in Type III.
+        logger (logging.Logger): The logger instance used for logging errors.
+        
+    Returns:
+        np.ndarray: The corrected array.
+    
+    Raises:
+        ValueError: If the input arrays do not have the same shape.
+    """
+  
+    if not (ct.shape == source.shape == loc_data.shape):
+        error_message = "Input arrays must have the same shape."
+        logger.error(f"{THIS} {error_message}")
+        raise ValueError(error_message)
+    
+    # Calculate the expressions for conditions
+    adjustment_2 = (m_2 * source + c_2) * loc_data
+    adjustment_3 = (m_3 * source + c_3) * loc_data
+
+    # Apply conditions efficiently
+    mask = ct >= separation_point
+    ct[mask] = ct[mask] - adjustment_2[mask] #+ (qn_bg_filled * loc_data)[mask]
+    ct[~mask] = ct[~mask] - adjustment_3[~mask] #+ (qn_bg_filled * loc_data)[~mask]
+    
+    return ct
+
+def linear_fit(x, y, m=None, c=None):
+    """
+    Perform linear regression with options for fixing the slope or intercept.
+    
+    Args:
+        x (array-like): Independent variable (value of source pixel).
+        y (array-like): Dependent variable (value of corresponding cross-talk pixel).
+        m (float, optional): Fixed slope. If None, the slope is estimated.
+        c (float, optional): Fixed intercept. If None, the intercept is estimated.
+    
+    Returns:
+        dict: A dictionary with slope (`m`), intercept (`c`), and their uncertainties.
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    # Case 1: both m and c free — use sklearn + stats
+    if m is None and c is None:
+        x_reshaped = x.reshape(-1, 1) if x.ndim == 1 else x
+        model = LinearRegression().fit(x_reshaped, y)
+        slope = model.coef_[0]
+        intercept = model.intercept_
+
+        stats_result = stats.linregress(x, y)
+        return {
+            'm': slope,
+            'm_uncertainty': stats_result.stderr,
+            'c': intercept,
+            'c_uncertainty': stats_result.intercept_stderr,
+            'r_value': stats_result.rvalue,
+            'p_value': stats_result.pvalue,
+        }
+
+    # Case 2: m fixed, c free
+    if m is not None and c is None:
+        def model(x, c):
+            return m * x + c
+
+        popt, pcov = curve_fit(model, x, y)
+        c_fit = popt[0]
+        c_uncertainty = np.sqrt(pcov[0, 0])
+        return {'m': m, 'm_uncertainty': 0.0, 'c': c_fit, 'c_uncertainty': c_uncertainty}
+
+    # Case 3: m free, c fixed
+    if m is None and c is not None:
+        def model(x, m):
+            return m * x + c
+
+        popt, pcov = curve_fit(model, x, y)
+        m_fit = popt[0]
+        m_uncertainty = np.sqrt(pcov[0, 0])
+        return {'m': m_fit, 'm_uncertainty': m_uncertainty, 'c': c, 'c_uncertainty': 0.0}
+    
+def run_linear_fits(X_t2, Y_t2, X_t3, Y_t3, m2=None, c2=None, m3=None, c3=None):
+    """
+    Perform linear fits for both above and below threshold data, either with fixed or free slope 
+    (m) and intercept (c). It returns a dictionary containing the results for both datasets.
+    
+    Args:
+    X_t2 (1D array): Independent variable data for Type II source pixels.
+    Y_t2 (1D array): Dependent variable data for Type II cross-talk pixels.
+    X_t3 (1D array): Independent variable data for Type III source pixels.
+    Y_t3 (1D array): Dependent variable data for Type III cross-talk pixels.
+    m2 (float, optional): Slope for Type II data. If None, it will be calculated during
+    fitting.
+    c2 (float, optional): Intercept for Type II data. If None, it will be calculated during
+    fitting.
+    m3 (float, optional): Slope for Type III data. If None, it will be calculated during
+    fitting.
+    c3 (float, optional): Intercept for Type III data. If None, it will be calculated during
+    fitting.
+        
+    Returns
+    dict: A dictionary with the fitting results for both Type II and III data.
+    """
+    results = {}
+
+    # --- Fit for ABOVE data ---
+    if m2 is not None and c2 is not None:
+        # both m and c fixed
+        y_pred = fully_fixed_model(X_t2, m2, c2)
+        results['t2'] = {
+            'm': m2,
+            'c': c2,
+            'm_uncertainty': 0.0,
+            'c_uncertainty': 0.0,
+            'y_pred': y_pred
+        }
+    else:
+        res = linear_fit(X_t2, Y_t2, m=m2, c=c2)
+        res['y_pred'] = res['m'] * X_t2 + res['c']
+        results['t2'] = res
+
+    # --- Fit for BELOW data ---
+    if m3 is not None and c3 is not None:
+        # both m and c fixed
+        y_pred = fully_fixed_model(X_t3, m3, c3)
+        results['t3'] = {
+            'm': m3,
+            'c': c3,
+            'm_uncertainty': 0.0,
+            'c_uncertainty': 0.0,
+            'y_pred': y_pred
+        }
+    else:
+        res = linear_fit(X_t3, Y_t3, m=m3, c=c3)
+        res['y_pred'] = res['m'] * X_t3 + res['c']
+        results['t3'] = res
+    
+    return results
+    
+def get_correction(image_file, final_mask, type1_pixels, source, ct, shifter_value, m2, c2, m3, c3, plot_flag, v, th_mask, lc_mask, lc_on, logger, loc, axis = None):
+    """
+    Perform cross-talk correction on quadrant image data using linear fitting and masking strategies.
+
+    This function identifies different pixel types involved in cross-talk (Type I, II, III), performs 
+    statistical background estimation and subtraction, applies a Gaussian Mixture Model (GMM) for 
+    data separation, and fits two linear models to the cross-talk data. It then applies a two-phase 
+    correction using fitted parameters and a machine learning-based post-correction using bounding boxes.
+
+    Args:
+    – image file (str): The path to the FITS image file being processed, used for logging and
+    output file naming.
+    – final mask (np.ndarray): Boolean or binary mask identifying cross-talk-affected pixels.
+    – type1 pixels (np.ndarray): Mask indicating pixels involved in Type I cross-talk.
+    – source (np.ndarray): Source quadrant pixel data.
+    – ct (np.ndarray): Target quadrant pixel data (to be corrected).
+    – shifter value (float): Additional correction shift applied during the final correction
+    step for Type I.
+    – m2, c2 (float): Initial slope and intercept guesses for Type II linear fit.
+    – m3, c3 (float): Initial slope and intercept guesses for Type III linear fit.
+    – plot flag (bool): Whether to generate and save visual plots for diagnostics.
+    – v (bool): Verbosity flag to log additional debugging information.
+    – th mask (np.ndarray): Thorium mask.
+    – lc mask (np.ndarray): Laser comb mask.
+    – lc on (bool): If True, lc mask is used in background estimation.
+    – logger (logging.Logger): Logger object to record progress and results.
+    – loc (str): Quadrant location string indicating correction direction (e.g., ”4 1” means
+    correction in Q4 from Q1).
+    – axis (int, optional): Axis along which flipping and certain operations are performed;
+    default is None.
+    Returns:
+    – ct corrected (np.ndarray): The corrected image data after applying cross-talk correc-
+    tion.
+    – combined mask (np.ndarray): An array indicating pixel types 0 (unaffected), 1 (Type
+    I), and 2 (Type II and III).
+
+    Notes
+    -----
+    - Applies Gaussian Mixture Model (GMM) clustering to distinguish Type II and Type III pixels.
+    - Fits two separate linear models to each type, storing slope/intercept with uncertainties.
+    - Background estimated using unmasked regions, filled via median imputation.
+    - Results are logged and optionally visualized at various stages.
+    - Final correction is performed in two steps:
+        1. Type II & III correction using linear fits.
+        2. Type I correction using a random forest model.
+
+    Outputs
+    -------
+    - Diagnostic plots for background, correction, and fitting, saved as PNGs if `plot_flag` is True.
+    - Results appended to a CSV file named `Output.csv`.
+    """
+
+    # Filter the points where both source and cross-talk are non-zero
+    mask_considered = (final_mask > 0) ^ (type1_pixels > 0)
+    
+    mask1 = type1_pixels
+    mask2 = final_mask ^ mask1
+
+    masked_image1 = source * mask1 # Exterior Region (Type I)
+    masked_image2 = source * mask2 # Type II & Type III
+       
+    # Generate bounding boxes (using the threshold value as needed)
+    threshold = 0  # Adjust the threshold value based on your data
+    binary_data = np.flip(final_mask,axis) != threshold
+    labeled_data, num_features = label(binary_data)
+    slices = find_objects(labeled_data)
+
+    bounding_boxes = []
+    for slice_tuple in slices:
+        if slice_tuple is not None:
+            bbox = [(slice_.start, slice_.stop) for slice_ in slice_tuple]
+            bounding_boxes.append(bbox)
+    
+    mask_considered = masked_image2 != 0
+    
+    ct_mask = np.flip((masked_image1 + masked_image2) > 0, axis)
+    
+    if lc_on:
+        bg_mask = ~(lc_mask | th_mask | ct_mask)
+    
+    else:
+        bg_mask = ~(th_mask | ct_mask)
+    
+    qn_bg = np.where(bg_mask, ct, np.nan)
+    
+    if plot_flag:
+        plt.imshow(qn_bg, vmin = -10, vmax = 10, origin = 'lower')
+        plt.colorbar()
+        plt.grid(False)
+        plt.savefig(str(image_file[-16:])+"_bg_rm_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
+        plt.show()
+            
+    imputer = SimpleImputer(missing_values = np.nan, strategy='median')
+    qn_bg_filled = imputer.fit_transform(qn_bg)
+    
+    if plot_flag:
+        plt.imshow(qn_bg_filled, vmin = -10, vmax = 10, origin = 'lower')
+        plt.colorbar()
+        plt.grid(False)
+        plt.savefig(str(image_file[-16:])+"_bg_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
+        plt.show()
+        
+    source_ = np.flip((mask_considered != 0) * source, axis)
+    ct_ = (np.flip((mask_considered != 0), axis) * ct) - (np.flip((mask_considered != 0), axis) * qn_bg_filled)
+    
+    if plot_flag:
+        plt.imshow(ct_, vmin = -10, vmax = 10, origin = 'lower')
+        plt.colorbar()
+        plt.grid(False)
+        plt.savefig(str(image_file[-16:])+"_bg_corr_ct_q_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
+        plt.show()
+   
+    # Flatten the arrays for easy filtering
+    source_flat = source_.flatten()
+    ct_flat = ct_.flatten()
+    
+    ignore_values = 150
+    
+    # Apply the filter: keep only the points where both source and ct are non-zero
+    non_zero_indices = ((source_flat != 0) | (ct_flat != 0)) & (ct_flat <= ignore_values)
+    non_zero_ignored = ((source_flat != 0) | (ct_flat > 0)) & (ct_flat > ignore_values)
+
+    # Assuming source_flat and ct_flat are defined, and non_zero_indices is already known
+    source_data = source_flat[non_zero_indices]
+    ct_data = ct_flat[non_zero_indices]
+
+    # Step 1: Use Gaussian Mixture Model (GMM) to identify clusters in ct_data
+    gmm = GaussianMixture(n_components=2, random_state=42)
+    ct_data_reshaped = ct_data.reshape(-1, 1)
+    gmm.fit(ct_data_reshaped)
+
+    # Get the means of the two clusters
+    cluster_means = np.sort(gmm.means_.flatten())
+
+    # Calculate the separation point as the midpoint between the two cluster means
+    separation_point = np.mean(cluster_means)
+           
+    # Step 2: Split the data into two sets (below and above the separation point)
+    mask_t3 = (ct_data < separation_point)
+    mask_t2 = (ct_data > separation_point)
+    
+    # Type III
+    t3_source = source_data[mask_t3]
+    t3_ct = ct_data[mask_t3]
+    
+    # Type II
+    t2_source = source_data[mask_t2]
+    t2_ct = ct_data[mask_t2]
+    
+    final_results = run_linear_fits(t2_source, t2_ct, t3_source, t3_ct, m2, c2, m3, c3)        
+    
+    m_2 = final_results['t2']['m']
+    m_2e = final_results['t2']['m_uncertainty']
+    c_2 = final_results['t2']['c']
+    c_2e = final_results['t2']['c_uncertainty']
+    y_pred_t2 = final_results['t2']['y_pred']
+    
+    
+    m_3 = final_results['t3']['m']
+    m_3e = final_results['t3']['m_uncertainty']
+    c_3 = final_results['t3']['c']
+    c_3e = final_results['t3']['c_uncertainty']
+    y_pred_t3 = final_results['t3']['y_pred']
+
+    if v or plot_flag:
+
+        # Step 7: Log slope, intercept, and uncertainties for both fits with precision
+
+        if loc == "4_1":
+            logger.info(f"{THIS} Correction in Q4 from Q1. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "4_2":
+            logger.info(f"{THIS} Correction in Q4 from Q2. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "3_1":
+            logger.info(f"{THIS} Correction in Q3 from Q1. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "3_2":
+            logger.info(f"{THIS} Correction in Q3 from Q2. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "2_1":
+            logger.info(f"{THIS} Correction in Q2 from Q1. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "1_2":
+            logger.info(f"{THIS} Correction in Q1 from Q2. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        logger.info(f"{THIS} Linear Fit Results for Type II Pixels: [{image_file[-16:]}]")
+        logger.info(f"{THIS} Slope (m): {m_2:.11f} ± {abs(m_2e):.11f}")
+        logger.info(f"{THIS} Intercept (c): {c_2:.7f} ± {abs(c_2e):.7f}")
+
+        logger.info(f"{THIS} Linear Fit Results for Type III Pixels: [{image_file[-16:]}]")
+        logger.info(f"{THIS} Slope (m): {m_3:.11f} ± {abs(m_3e):.11f}")
+        logger.info(f"{THIS} Intercept (c): {c_3:.7f} ± {abs(c_3e):.7f}")
+
+     
+    if plot_flag:   
+        # Plotting
+        plt.figure(figsize=(12, 8))
+
+        # Plot Set 1 (below separation)
+        plt.scatter(t3_source, t3_ct, color='blue', label='Type III')
+        plt.plot(t3_source, y_pred_t3, color='blue', label=f'Best Fit (Type III): y = {m_3:.6f}x + {c_3:.2f}')
+
+        # Plot Set 2 (above separation)
+        plt.scatter(t2_source, t2_ct, color='red', label='Type II')
+        plt.plot(t2_source, y_pred_t2, color='red', label=f'Best Fit (Type II): y = {m_2:.6f}x + {c_2:.2f}')
+
+        # Plot the points greater than ignored values for context
+        ignored_source = source_flat[non_zero_ignored]
+        ignored_ct = ct_flat[non_zero_ignored]
+        plt.scatter(ignored_source, ignored_ct, color='grey', alpha=0.5, label=f'Points > {ignore_values:.0f}')
+        
+        # Labels and title
+        plt.xlabel('Source Pixels')
+        plt.ylabel('Cross-talk Pixels')
+        plt.title('Best Fit Lines and Uncertainty Regions with Automatically Identified Separation [' + image_file[-16:] + ']')
+        plt.legend()
+        
+        plt.savefig(str(image_file[-16:])+"_CFs_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
+        
+        # Show plot
+        plt.show()
+           
+    csv_file = "Output.csv"
+    
+    # Base headers
+    headers = ["UTMJD", "FILEORIG"]
+    suffixes = ["T1", "T2_M", "T2_ME", "T2_C", "T2_CE", "T3_M", "T3_ME", "T3_C", "T3_CE"]
+    
+    # Define the complete header structure in order
+    headers = ["UTMJD", "FILEORIG"] + [
+    f"{q}_{suffix}" for q in ["Q4_Q1", "Q4_Q2", "Q3_Q1", "Q3_Q2", "Q2_Q1", "Q1_Q2"]
+    for suffix in suffixes]
+    
+    data_values = {
+    f"{convert_loc_to_q_format(loc)}_{suffix}": value 
+    for suffix, value in zip(
+        suffixes,
+        (
+            shifter_value, 
+            m_2,
+            m_2e,
+            c_2, 
+            c_2e,
+            m_3, 
+            m_3e, 
+            c_3, 
+            c_3e
+        )
+    ) 
+}
+  
+    write_to_csv(image_file, loc, data_values, suffixes, csv_file, headers, logger)
+    
+    # Initialize combined mask with zeros
+    combined_mask = np.zeros_like(ct, dtype=np.uint8)
+    
+    # Process for correction using bounding boxes
+    loc_data = (np.flip(masked_image2, axis) > 0)
+    combined_mask[loc_data] = 2
+    ct_corrected = make_correction(ct, loc_data, np.flip(source,axis), separation_point, m_2, c_2, m_3, c_3, logger)
+    
+    corr_1 = ct_corrected.copy()
+    loc_data = (np.flip(masked_image1, axis) > 0) * ct
+    combined_mask[loc_data > 0] = 1
+    ct_corrected = apply_random_forest_with_bounding_boxes(loc_data, corr_1, shifter_value, bounding_boxes=bounding_boxes)
+    
+    return ct_corrected, combined_mask
+
+def amp_mode(CFs, mjd_row, logger):
+    """
+    Args:
+    – CFs (np.ndarray): The input ND array of correction coefficients.
+    – mjd row (int): The row index from which to read.
+    
+    Returns:
+    – int: The value of amplifier mode (either 2 or 4) of the specified row.
+    """
+    if not isinstance(CFs, np.ndarray) or CFs.ndim != 2:
+        error_message = "Input CFs must be a 2D NumPy array."
+        logger.error(f"{THIS} {error_message}")
+        raise ValueError(error_message)
+
+    if not (0 <= mjd_row < CFs.shape[0]):
+        error_message = f"Row index {mjd_row} is out of bounds for array with {CFs.shape[0]} rows."
+        logger.error(f"{THIS} {error_message}")
+        raise IndexError(error_message)
+    
+    return int(CFs[mjd_row, 1])  # Column 1 (second column, index 1)
+
+def get_data_for_location(CFs, mjd_row, loc, logger):
+    """
+    Retrieve the calibration data for a specific location and row from the CFs array.
+
+    This function extracts the calibration factors (m and c values) for a given location and
+    row from the `CFs` array, using a pre-defined mapping of locations to column indices.
+
+    Parameters:
+    CFs : np.ndarray
+        A 2D numpy array containing the calibration factors. Each row corresponds to a particular
+        measurement date (MJD), and each column corresponds to a specific calibration parameter.
+        
+    mjd_row : int
+        The row index corresponding to the Modified Julian Date (MJD) for which the data is requested.
+        This should be a valid index within the bounds of the `CFs` array.
+
+    loc : str
+        A string representing the location identifier for which the calibration data is requested.
+        It should match one of the keys in the `loc_mapping` dictionary (e.g., "4_1", "3_2").
+
+    logger : logging.Logger
+        A logger object used to log error messages if invalid input is provided.
+
+    Returns:
+    tuple
+        A tuple containing the calibration values for the specified location and row:
+        (m_2, m_2e, c_2, c_2e, m_3, m_3e, c_3, c_3e), where:
+        - m_2, m_3 : Calibration slopes for two different models.
+        - m_2e, m_3e : Uncertainties for the calibration slopes.
+        - c_2, c_3 : Calibration intercepts for two different models.
+        - c_2e, c_3e : Uncertainties for the calibration intercepts.
+    
+    Raises:
+    ValueError
+        If the provided location is not in the predefined list of valid locations.
+        
+    IndexError
+        If the provided row index is out of bounds for the CFs array.
+    """
+    
+    loc_mapping = {
+        "4_1": {"m2": 5,   "m2e": 6,   "c2": 7,  "c2e": 8,
+                "m3": 9,   "m3e": 10,  "c3": 11, "c3e": 12},
+        
+        "4_2": {"m2": 14,  "m2e": 15,  "c2": 16, "c2e": 17,
+                "m3": 18,  "m3e": 19,  "c3": 20, "c3e": 21},
+        
+        "3_1": {"m2": 50,  "m2e": 51,  "c2": 52, "c2e": 53,
+                "m3": 54,  "m3e": 55,  "c3": 56, "c3e": 57},
+        
+        "3_2": {"m2": 23,  "m2e": 24,  "c2": 25, "c2e": 26,
+                "m3": 27,  "m3e": 28,  "c3": 29, "c3e": 30},
+        
+        "2_1": {"m2": 32,  "m2e": 33,  "c2": 34, "c2e": 35,
+                "m3": 36,  "m3e": 37,  "c3": 38, "c3e": 39},
+        
+        "1_2": {"m2": 41,  "m2e": 42,  "c2": 43, "c2e": 44,
+                "m3": 45,  "m3e": 46,  "c3": 47, "c3e": 48}
+                   }
+    
+    # Check if the provided location exists in our mapping.
+    if loc not in loc_mapping:
+        error_message = f"Invalid location '{loc}'. Valid locations are: {list(loc_mapping.keys())}"
+        logger.error(f"{THIS} {error_message}")
+        raise ValueError(error_message)
+
+    # Check if the provided row index is within the array bounds.
+    if mjd_row < 0 or mjd_row >= CFs.shape[0]:
+        error_message = f"Row index {mjd_row} is out of bounds for array with shape {CFs.shape}"
+        logger.error(f"{THIS} {error_message}")
+        raise IndexError(error_message)
+
+    # Get the dictionary of column indices for the provided location.
+    indices = loc_mapping[loc]
+
+    # Retrieve the data from the CFs array for the specified row and columns.
+    m_2   = CFs[mjd_row][indices["m2"]]
+    m_2e  = CFs[mjd_row][indices["m2e"]]
+    c_2   = CFs[mjd_row][indices["c2"]]
+    c_2e  = CFs[mjd_row][indices["c2e"]]
+    m_3   = CFs[mjd_row][indices["m3"]]
+    m_3e  = CFs[mjd_row][indices["m3e"]]
+    c_3   = CFs[mjd_row][indices["c3"]]
+    c_3e  = CFs[mjd_row][indices["c3e"]]
+
+    # Return the values; you can also return a dictionary if that suits your application.
+    return m_2, m_2e, c_2, c_2e, m_3, m_3e, c_3, c_3e
+
+def correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, type1_pixels, v, plot_flag, source, ct, logger, shifter_value, loc, axis = None):
+    """
+    Perform a correction to the image using known calibration factors (CFs) for a given location.
+
+    This function performs a series of corrections on an image array based on calibration factors,
+    applying a Gaussian Mixture Model (GMM) to identify and separate clusters in the data. The
+    function uses known CFs (m2, m2e, c2, c2e, m3, m3e, c3, c3e) to apply corrections for Type II and
+    Type III pixels, and adjusts the array using a Random Forest model for bounding boxes in the image.
+
+    Parameters:
+    image_file : str
+        The file path of the image being processed.
+        
+    mjd_input : int
+        The Modified Julian Date (MJD) input that corresponds to the calibration row.
+        
+    CFs : np.ndarray
+        A 2D array of calibration factors. Each row corresponds to a particular MJD, and each column
+        contains a specific calibration parameter (e.g., slope, intercept, and their uncertainties).
+        
+    mjd_row : int
+        The row index corresponding to the MJD for which the calibration factors are applied.
+        
+    final_mask : np.ndarray
+        A mask array of the image indicating the areas to be considered for correction.
+        
+    type1_pixels : np.ndarray
+        A binary mask for Type I pixels.
+        
+    v : bool
+        Flag indicating whether to log verbose information for debugging or reporting.
+        
+    source : np.ndarray
+        The source image or data to be used in the correction.
+        
+    array : np.ndarray
+        The image array to be corrected.
+        
+    logger : logging.Logger
+        A logger object used to log information, warnings, or errors.
+        
+    shifter_value : float
+        A value used for shifting the results, potentially to align with specific corrections or shifts.
+        
+    loc : str
+        A string representing the location key, which corresponds to a specific calibration factor set.
+        
+    axis : int, optional
+        The axis along which the image is flipped (default is None, meaning no axis flipping).
+
+    Returns
+    -------
+    array_corrected : np.ndarray
+        The corrected image data after applying cross-talk suppression.
+    combined_mask : np.ndarray
+        An array indicating pixel types:
+            - 0: Unaffected
+            - 1: Type I
+            - 2: Type II & III
+
+    Example:
+    >>> correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, type1_pixels, v=True, source=source_array, array=image_array, logger=my_logger, shifter_value=1.5, loc='4_1')
+    (corrected_image_array, combined_mask)
+
+    Notes:
+    - The correction process involves several steps: applying a Gaussian Mixture Model to the data to identify clusters,
+      and using pre-calculated slopes and intercepts to apply corrections based on the location.
+    - Bounding boxes are generated to fine-tune corrections using a Random Forest model.
+    """
+
+    mask_considered = (final_mask > 0) ^ (type1_pixels > 0)
+    
+    mask1 = type1_pixels
+    mask2 = final_mask ^ mask1
+
+    # Generate bounding boxes (using the threshold value as needed)
+    threshold = 0  # Adjust the threshold value based on your data
+    binary_data = np.flip(final_mask,axis) != threshold
+    labeled_data, num_features = label(binary_data)
+    slices = find_objects(labeled_data)
+
+    bounding_boxes = []
+    for slice_tuple in slices:
+        if slice_tuple is not None:
+            bbox = [(slice_.start, slice_.stop) for slice_ in slice_tuple]
+            bounding_boxes.append(bbox)
+ 
+    # Flatten the arrays for easy filtering
+    source_flat = (mask1*source).flatten()    
+    ct_flat = ((np.flip(mask2, axis) != 0)*ct).flatten()
+    
+    ignore_values = 150
+    # Apply the filter: keep only the points where both source and ct are non-zero
+    non_zero_indices = ((source_flat != 0) | (ct_flat != 0)) & (ct_flat <= ignore_values)
+    non_zero_ignored = ((source_flat != 0) | (ct_flat > 0)) & (ct_flat > ignore_values)
+
+    # Assuming source_flat and ct_flat are defined, and non_zero_indices is already known
+    source_data = source_flat[non_zero_indices]
+    ct_data = ct_flat[non_zero_indices]
+
+    # Step 1: Use Gaussian Mixture Model (GMM) to identify clusters in ct_data
+    gmm = GaussianMixture(n_components=2, random_state=42)
+    ct_data_reshaped = ct_data.reshape(-1, 1)
+    gmm.fit(ct_data_reshaped)
+
+    # Get the means of the two clusters
+    cluster_means = np.sort(gmm.means_.flatten())
+
+    # Calculate the separation point as the midpoint between the two cluster means
+    separation_point = np.mean(cluster_means)
+    
+    results = get_data_for_location(CFs, mjd_row, loc, logger)
+    m_2, m_2e, c_2, c_2e, m_3, m_3e, c_3, c_3e = results
+
+    if v or plot_flag:
+
+        # Step 7: Log slope, intercept, and uncertainties for both fits with precision
+
+        if loc == "4_1":
+            logger.info(f"{THIS} Correction in Q4 from Q1. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "4_2":
+            logger.info(f"{THIS} Correction in Q4 from Q2. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "3_1":
+            logger.info(f"{THIS} Correction in Q3 from Q1. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "3_2":
+            logger.info(f"{THIS} Correction in Q3 from Q2. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "2_1":
+            logger.info(f"{THIS} Correction in Q2 from Q1. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        if loc == "1_2":
+            logger.info(f"{THIS} Correction in Q1 from Q2. [{image_file[-16:]}]")
+            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
+
+        logger.info(f"{THIS} Linear Fit Results for Type II Pixels: [{image_file[-16:]}]")
+        logger.info(f"{THIS} Slope (m): {m_2:.11f} ± {abs(m_2e):.11f}")
+        logger.info(f"{THIS} Intercept (c): {c_2:.7f} ± {abs(c_2e):.7f}")
+
+        logger.info(f"{THIS} Linear Fit Results for Type III Pixels: [{image_file[-16:]}]")
+        logger.info(f"{THIS} Slope (m): {m_3:.11f} ± {abs(m_3e):.11f}")
+        logger.info(f"{THIS} Intercept (c): {c_3:.7f} ± {abs(c_3e):.7f}")
+    
+    masked_image1 = source * mask1 # Exterior Region (Type I)
+    masked_image2 = source * mask2 # Type II & Type III
+    
+    # Initialize combined mask with zeros
+    combined_mask = np.zeros_like(ct, dtype=np.uint8)
+    
+    loc_data = (np.flip(masked_image2, axis) > 0)
+    combined_mask[loc_data] = 2
+    ct_corrected = make_correction(ct, loc_data, np.flip(source,axis), separation_point, m_2, c_2, m_3, c_3, logger)
+
+    corr_1 = ct_corrected.copy()
+    loc_data = (np.flip(masked_image1, axis) > 0) * ct
+    combined_mask[loc_data > 0] = 1
+    ct_corrected = apply_random_forest_with_bounding_boxes(loc_data, corr_1, shifter_value, bounding_boxes=bounding_boxes)
+
+    return ct_corrected, combined_mask
+
+
+def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, log_dir=None):
+    """
+    Processes a single FITS image file to extract quadrant data, generate source masks,
+    and prepare for crosstalk correction using predefined correction factors.
+
+    Parameters:
+    -----------
+    plot_flag : bool
+        Flag to control plotting of intermediate or final outputs.
+    l : bool
+        Placeholder for additional data or flags.
+    v : bool
+        Placeholder for additional data or flags.
+    cal : bool
+        Calibration mode or configuration.
+    mask1_threshold : float
+        Threshold value used for source masking in quadrant Q1.
+    mask2_threshold : float
+        Threshold value used for source masking in quadrant Q2.
+    q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs : any
+        Correction factors for specific quadrant-to-quadrant crosstalks.
+    skip : list of str
+        List of crosstalk correction pairs (e.g., 'q4_q1', 'q3_q2') to skip during processing.
+    image_file : str
+        Path to the FITS image file to be processed.
+    log_dir : str, optional
+        Directory path where the processing log should be saved. If not specified, logs may not be written.
+
+    Returns:
+    --------
+    None
+        The function performs operations such as logging, quadrant extraction, and masking
+
+    Notes:
+    ------
+    - The FITS image is assumed to be divided into four quadrants:
+        Q1: Top-left     [2056:4112, 0:2101]
+        Q2: Bottom-left  [0:2056,   0:2101]
+        Q3: Bottom-right [0:2056,   2101:4202]
+        Q4: Top-right    [2056:4112, 2101:4202]
+
+    - If crosstalk for a quadrant pair is not in the `skip` list, a mask is created for the source quadrant
+      using a specified pixel value threshold, and selected pixels are identified where counts exceed 60,000.
+
+    - Logging is configured per process (based on PID), and logs details such as mask creation.
+
+    - A large correction factor (CFs) table is hardcoded and intended to be used later in the processing
+      to perform crosstalk correction based on date, quadrant pair, and other metadata.
+
+    - Headers and layout of the CFs array are documented in the source code comment block.
+    """
+    
+    pid = os.getpid()
+    log_file = os.path.join(log_dir, f"log_{pid}_{os.path.basename(image_file)}.log")
+    logger = setup_logger(log_file)
+
+    logger.info(f"{THIS} Started processing {image_file}")
+    
+    start_time = time.time()
+    
+    # Load the image data
+    image_data = load_fits_image(image_file, logger)
+
+    # Extract quadrants
+    q1 = image_data[2056:4112, 0:2101]  # Q1 = Top Left
+    q2 = image_data[0:2056, 0:2101]
+    q3 = image_data[0:2056, 2101:4202]
+    q4 = image_data[2056:4112, 2101:4202]  # Q4 = Top Right
+    
+
+    if 'q4_q1' not in skip or 'q2_q1' not in skip or 'q3_q1' not in skip:
+        final_mask_1 = get_source_mask(q1, 6000)
+        type1_pixels_1 = ((final_mask_1 > 0) * q1) > 60000
+        logger.info(f"{THIS} Mask 1 Created. [{image_file[-16:]}]")
+    
+    if 'q4_q2' not in skip or 'q3_q2' not in skip or 'q1_q2' not in skip:
+        final_mask_2 = get_source_mask(q2, 4000)  
+        type1_pixels_2 = ((final_mask_2 > 0) * q2) > 60000
+        logger.info(f"{THIS} Mask 2 Created. [{image_file[-16:]}]")
+   
+    
+    """
+    Headers for CFs Array:
+    Year, Mode, UTMJD_0, UTMJD_1, Q4_Q1_T1, Q4_Q1_T2_M, Q4_Q1_T2_ME, Q4_Q1_T2_C, Q4_Q1_T2_CE, Q4_Q1_T3_M, Q4_Q1_T3_ME, Q4_Q1_T3_C, Q4_Q1_T3_CE, Q4_Q2_T1, Q4_Q2_T2_M, Q4_Q2_T2_ME, Q4_Q2_T2_C, Q4_Q2_T2_CE, Q4_Q2_T3_M, Q4_Q2_T3_ME, Q4_Q2_T3_C, Q4_Q2_T3_CE, Q3_Q2_T1, Q3_Q2_T2_M, Q3_Q2_T2_ME, Q3_Q2_T2_C, Q3_Q2_T2_CE, Q3_Q2_T3_M, Q3_Q2_T3_ME, Q3_Q2_T3_C, Q3_Q2_T3_CE, Q2_Q1_T1, Q2_Q1_T2_M, Q2_Q1_T2_ME, Q2_Q1_T2_C, Q2_Q1_T2_CE, Q2_Q1_T3_M, Q2_Q1_T3_ME, Q2_Q1_T3_C, Q2_Q1_T3_CE, Q1_Q2_T1, Q1_Q2_T2_M, Q1_Q2_T2_ME, Q1_Q2_T2_C, Q1_Q2_T2_CE, Q1_Q2_T3_M, Q1_Q2_T3_ME, Q1_Q2_T3_C, Q1_Q2_T3_CE, Q3_Q1_T1, Q3_Q1_T2_M, Q3_Q1_T2_ME, Q3_Q1_T2_C, Q3_Q1_T2_CE, Q3_Q1_T3_M, Q3_Q1_T3_ME, Q3_Q1_T3_C, Q3_Q1_T3_CE
+    
+    Qn: Quadrant (1,2,3,4)
+    * Year: Year in which data was collected.
+    * Mode: Amplifier mode used, either 2 or 4. If 2 then only cross-talk will be available in the file are from Q1 to Q4 and Q2 to Q3.
+    * UTMJD_n: Range of UTMJDs (_0 to _1). If the UTMJD of a given file lies in the range then it will use that perticular row to get the correction factors.
+    * Tn: Type of a cross-talk (1,2,3)
+    * M & ME: Slope & Uncertainty
+    * C & CE: Zero Point & Uncertainty
+    * Qn_Qm: Cross-talk in Qn from Qm. e.g., Q4_Q1: Cross-talk in quadrant 4 from the source in quadrant 1.
+    """
+    
+    CFs = np.array([
+        [2018, 4, 58378.6, 58387.9, 0.00E+00, 3.22E-04, 2.90E-05, 94.91, 1.14E+00, 4.54E-04, 2.47E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 85.75, 9.02E-01, 3.11E-05, 1.06E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+        
+        [2018, 4, 58437.0, 58449.5, 0.00E+00, 3.22E-04, 2.90E-05, 122.19, 4.40E-01, 7.25E-04, 1.29E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 81.13, 9.91E-01, 2.12E-04, 7.54E-05, 0.00E+00, 0.00E+00, 0.00E+00, 1.66E-04, 9.76E-05, 80.79, 1.68E+00, 6.32E-04, 5.72E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58504.3, 58517.9, 0.00E+00, 3.22E-04, 2.90E-05, 120.3, 4.16E-01, 7.26E-04, 1.07E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 80.89, 4.78E-01, 1.42E-04, 7.34E-05, 0.00E+00, 0.00E+00, 0.00E+00, 9.42E-06, 1.06E-04, 82.57, 2.12E+00, 6.10E-04, 6.60E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58581.4, 58585.9, 0.00E+00, 3.22E-04, 2.90E-05, 92.11, 6.66E-01, 4.85E-04, 9.45E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 84.89, 9.69E-01, 7.31E-05, 1.39E-05, 0.00E+00, 0.00E+00, 0.00E+00, 2.23E-04, 8.70E-05, 62.50, 7.71E-01, 4.33E-04, 1.65E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58585.9, 58588.9, 0.00E+00, 3.22E-04, 2.90E-05, 88.76, 2.27E-01, 4.74E-04, 5.60E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 83.11, 3.17E-01, 7.75E-05, 1.29E-05, 0.00E+00, 0.00E+00, 0.00E+00, 3.19E-04, 6.73E-05, 58.91, 4.46E-01, 4.19E-04, 1.27E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58588.9, 58608.9, 0.00E+00, 3.22E-04, 2.90E-05, 91.63, 2.32E-01, 5.13E-04, 1.12E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 80.75, 3.07E+00, 6.80E-05, 6.61E-05, 0.00E+00, 0.00E+00, 0.00E+00, 8.92E-05, 7.77E-05, 64.02, 8.97E-01, 4.36E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58608.9, 58610.9, 0.00E+00, 3.22E-04, 2.90E-05, 92.53, 2.93E-01, 5.00E-04, 1.39E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 85.88, 3.91E-01, 9.59E-05, 1.62E-05, 0.00E+00, 0.00E+00, 0.00E+00, 1.20E-04, 1.04E-04, 62.50, 9.55E-01, 4.43E-04, 2.34E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58610.9, 58615.9, 0.00E+00, 3.22E-04, 2.90E-05, 90.58, 7.83E-01, 5.07E-04, 9.90E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 79.56, 2.06E+00, 9.09E-05, 4.80E-05, 0.00E+00, 0.00E+00, 0.00E+00, 5.98E-05, 6.21E-05, 62.25, 7.43E-01, 4.44E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58620.2, 58620.8, 0.00E+00, 3.22E-04, 2.90E-05, 124.72, 4.44E-01, 7.85E-04, 1.33E-04, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 74.22, 1.76E+00, 4.06E-05, 4.68E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 83.14, 1.96E+00, 6.53E-04, 1.35E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58620.8, 58621.9, 0.00E+00, 3.22E-04, 2.90E-05, 119.47, 1.88E-01, 7.51E-04, 5.02E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 74.2, 1.39E+00, 3.79E-05, 9.21E-06, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 81.10, 3.46E-01, 6.11E-04, 8.28E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58621.9, 58634.9, 0.00E+00, 3.22E-04, 2.90E-05, 124.59, 5.33E-01, 7.79E-04, 7.23E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 77.24, 3.17E+00, 4.77E-05, 3.74E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 83.79, 5.50E-01, 6.41E-04, 8.61E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58634.9, 58636.3, 0.00E+00, 3.22E-04, 2.90E-05, 120.1, 5.57E-01, 7.62E-04, 4.14E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 76.56, 1.28E+00, 4.56E-05, 1.65E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 80.47, 8.19E-01, 6.08E-04, 6.40E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58636.3, 58659.9, 0.00E+00, 3.22E-04, 2.90E-05, 125.44, 4.43E-01, 7.94E-04, 1.44E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 77.24, 2.16E+00, 4.67E-05, 3.22E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 82.30, 1.07E+00, 6.44E-04, 5.23E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58659.9, 58714.7, 0.00E+00, 3.22E-04, 2.90E-05, 122.07, 4.96E-01, 7.77E-04, 2.80E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 79.24, 1.81E+00, 8.40E-05, 5.56E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 81.41, 2.05E+00, 6.22E-04, 7.41E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58715.8, 58736.4, 0.00E+00, 3.22E-04, 2.90E-05, 121.16, 1.73E+00, 7.52E-04, 4.99E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58736.4, 58745.9, 0.00E+00, 3.22E-04, 2.90E-05, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58755.3, 58792.8, 0.00E+00, 3.22E-04, 2.90E-05, 110.48, 8.29E-01, 7.66E-04, 1.41E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.46E-04, 1.79E-05, 109.71, 8.86E-01, 7.63E-04, 1.48E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58792.8, 58848.8, 0.00E+00, 3.22E-04, 2.90E-05, 107.98, 3.82E-01, 7.35E-04, 1.01E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.33E-04, 1.63E-05, 107.32, 7.46E-01, 7.28E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 58849.2, 58889.7, 0.00E+00, 3.22E-04, 2.90E-05, 106.01, 7.21E-01, 7.18E-04, 1.03E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.24E-04, 9.02E-06, 105.64, 6.72E-01, 7.03E-04, 9.34E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 58912.2, 58931.8, 0.00E+00, -1.98E-04, 2.41E-04, 75.04, 3.29E-01, 6.40E-04, 2.68E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 82.73, 5.02E-01, 6.37E-04, 6.20E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 58931.8, 59037.9, 0.00E+00, -1.98E-04, 2.41E-04, 71.45, 6.90E-01, 7.28E-04, 4.90E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 77.92, 8.29E-01, 6.51E-04, 5.09E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 4, 59072.2, 59084.9, 0.00E+00, 3.22E-04, 2.90E-05, 112.34, 6.35E-01, 7.81E-04, 3.17E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 78.8, 9.84E-01, 1.37E-04, 3.17E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 80.09, 9.66E-01, 5.45E-04, 3.08E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 4, 59084.9, 59177.3, 0.00E+00, 3.22E-04, 2.90E-05, 110.77, 7.52E-01, 7.11E-04, 1.90E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.4, 8.08E-01, 7.28E-05, 3.03E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 82.45, 4.68E-01, 5.85E-04, 1.31E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 59178.2, 59179.8, 0.00E+00, 3.22E-04, 2.90E-05, 74.75, 8.44E-02, 6.52E-04, 9.47E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 83.46, 8.66E-02, 5.89E-04, 6.55E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 4, 59205.2, 59213.8, 0.00E+00, 3.22E-04, 2.90E-05, 103.01, 7.29E-01, 6.87E-04, 3.36E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.36, 1.09E+00, 9.19E-05, 2.67E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 83.16, 2.02E-01, 6.09E-04, 1.42E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 4, 59265.3, 59280.9, 0.00E+00, 3.22E-04, 2.90E-05, 101.9964547, 6.23E-01, 6.76E-04, 1.43E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.65, 9.18E-01, 9.28E-05, 5.36E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 83.32, 6.04E-01, 5.99E-04, 1.62E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 4, 59280.9, 59455.9, 0.00E+00, 3.22E-04, 2.90E-05, 105.1650902, 8.33E-01, 7.16E-04, 1.55E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 74.66, 6.65E-01, 1.08E-04, 5.77E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 81.35, 6.42E-01, 6.28E-04, 2.14E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 2, 59456.2, 59512.8, 0.00E+00, 3.22E-04, 2.90E-05, 102.7105457, 1.03E+00, 6.78E-04, 1.39E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.49E-04, 1.73E-05, 101.51, 9.13E-01, 6.81E-04, 1.31E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 2, 59512.8, 59534.8, 0.00E+00, 3.22E-04, 2.90E-05, 99.96277008, 3.37E-01, 6.51E-04, 5.09E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.33E-04, 1.09E-05, 99.61, 4.84E-01, 6.56E-04, 9.48E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 2, 59534.8, 59536.7, 0.00E+00, 3.22E-04, 2.90E-05, 96.29001932, 1.87E+00, 6.32E-04, 1.54E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.42E-04, 1.84E-05, 95.12, 1.72E+00, 6.31E-04, 1.22E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2022, 2, 59745.0, 59751.8, 0.00E+00, -1.34E-03, 0.06E-03, 89.07, 4.14E-01, 1.86E-04, 3.38E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 86.37, 3.34E-01, 3.59E-05, 1.99E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2022, 2, 59801.3, 59809.2, 0.00E+00, -1.34E-03, 0.06E-03, 82.99, 4.59E-01, -2.73E-05, 3.28E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 81.59, 6.54E-01, -1.75E-04, 2.11E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2022, 2, 59821.2, 59926.5, 0.00E+00, -1.34E-03, 0.06E-03, 79.46, 3.08E-01, -1.13E-04, 3.83E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 78.79, 6.14E-01, -3.16E-04, 2.66E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan]
+])
+
+    mjd_input, other = extract_fits_headers(image_file, logger)
+    
+    mjd_mask = (CFs[:, 2] <= mjd_input) & (mjd_input <= CFs[:, 3])
+    mjd_row = np.where(mjd_mask==True)[0][0]
+    
+    amp = amp_mode(CFs, mjd_row, logger)
+      
+    ct_mask = np.zeros_like(image_data)
+    
+    if cal:
+ 
+        # Importing some important masks for processing
+        image_data_lc = load_fits_image(os.path.join(CAL_FILES_DIR, "mask1_LC_4.fits"), logger)
+        image_data_th = load_fits_image(os.path.join(CAL_FILES_DIR, "mask1_TH_4.fits"), logger)
+       
+        lc_on = check_lfc_lines(image_file, logger)
+  
+        # Extract quadrants_simth
+        q1_th = (image_data_th[2056:4112, 0:2101] == 0) # Q1 = Top Left
+        q2_th = (image_data_th[0:2056, 0:2101] == 0)
+        q3_th = (image_data_th[0:2056, 2101:4202] == 0)
+        q4_th = (image_data_th[2056:4112, 2101:4202] == 0)  # Q4 = Top Right
+  
+        # Extract quadrants_lc
+        q1_lc = (image_data_lc[2056:4112, 0:2101] == 0)  # Q1 = Top Left
+        q2_lc = (image_data_lc[0:2056, 0:2101] == 0)
+        q3_lc = (image_data_lc[0:2056, 2101:4202] == 0)
+        q4_lc = (image_data_lc[2056:4112, 2101:4202] == 0)  # Q4 = Top Right
+        
+        # Corr 4 with 1
+        if 'q4_q1' not in skip and amp in (4, 2):
+            image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = get_correction(image_file, final_mask_1, type1_pixels_1, q1, q4, *q4_q1_cfs, plot_flag, v, q4_th, q4_lc, lc_on, logger, loc = "4_1", axis=1)
+            logger.info(f"{THIS} Correction to Q4 with Q1 Done!! [{image_file[-16:]}]")
+       
+        # Corr 4 with 2
+        if 'q4_q2' not in skip and amp == 4:
+            image_data[2056:4112, 2101:4202], array_1 = get_correction(image_file, final_mask_2, type1_pixels_2, q2, q4, *q4_q2_cfs, plot_flag, v, q4_th, q4_lc, lc_on, logger, loc = "4_2", axis=None)
+            
+            region = ct_mask[2056:4112, 2101:4202]
+            updated_region = np.where(array_1 != 0, array_1, region)
+            ct_mask[2056:4112, 2101:4202] = updated_region
+            logger.info(f"{THIS} Correction to Q4 with Q2 Done!! [{image_file[-16:]}]")
+
+        # Corr 3 with 1
+        if 'q3_q1' not in skip and amp == 4:
+            image_data[0:2056, 2101:4202], ct_mask[0:2056, 2101:4202] = get_correction(image_file, final_mask_1, type1_pixels_1, q1, q3, *q3_q1_cfs, plot_flag, v, q3_th, q3_lc, lc_on, logger, loc = "3_1", axis=None)
+            logger.info(f"{THIS} Correction to Q3 with Q1 Done!! [{image_file[-16:]}]")
+
+        # Corr 3 with 2
+        if 'q3_q2' not in skip and amp in (4, 2):
+            image_data[0:2056, 2101:4202], array_2 = get_correction(image_file, final_mask_2, type1_pixels_2, q2, q3, *q3_q2_cfs, plot_flag, v, q3_th, q3_lc, lc_on, logger, loc = "3_2", axis=1)
+            
+            region = ct_mask[0:2056, 2101:4202]
+            updated_region = np.where(array_2 != 0, array_2, region)
+            ct_mask[0:2056, 2101:4202] = updated_region
+            logger.info(f"{THIS} Correction to Q3 with Q2 Done!! [{image_file[-16:]}]")
+
+        # Corr 2 with 1
+        if 'q2_q1' not in skip and amp == 4:
+            image_data[0:2056, 0:2101], ct_mask[0:2056, 0:2101] = get_correction(image_file, final_mask_1, type1_pixels_1, q1, q2, *q2_q1_cfs, plot_flag, v, q2_th, q2_lc, lc_on, logger, loc = "2_1", axis = 0)
+            logger.info(f"{THIS} Correction to Q2 with Q1 Done!! [{image_file[-16:]}]")
+
+        # Corr 1 with 2
+        if 'q1_q2' not in skip and amp == 4:
+            image_data[2056:4112, 0:2101], ct_mask[2056:4112, 0:2101] = get_correction(image_file, final_mask_2, type1_pixels_2, q2, q1, *q1_q2_cfs, plot_flag, v, q1_th, q1_lc, lc_on, logger, loc = "1_2", axis = 0)
+            logger.info(f"{THIS} Correction to Q1 with Q2 Done!! [{image_file[-16:]}]")
+    
+
+    else: 
+
+        # Corr 4 with 1
+        if 'q4_q1' not in skip and amp in (4, 2):
+            image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q4, logger, shifter_value=0, loc = "4_1", axis=1)
+            logger.info(f"{THIS} Correction to Q4 with Q1 Done!! [{image_file[-16:]}]")
+
+        # Corr 4 with 2
+        if 'q4_q2' not in skip and amp == 4:
+            image_data[2056:4112, 2101:4202], array_1 = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_2, type1_pixels_2, v, plot_flag, q2, q4, logger, shifter_value=0, loc = "4_2", axis=None)
+            
+            region = ct_mask[2056:4112, 2101:4202]
+            updated_region = np.where(array_1 != 0, array_1, region)
+            ct_mask[2056:4112, 2101:4202] = updated_region
+            logger.info(f"{THIS} Correction to Q4 with Q2 Done!! [{image_file[-16:]}]")
+
+        # Corr 3 with 1
+        if 'q3_q1' not in skip and amp == 4:
+            image_data[0:2056, 2101:4202], ct_mask[0:2056, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q3, logger, shifter_value=0, loc = "3_1", axis=None)
+            logger.info(f"{THIS} Correction to Q3 with Q1 Done!! [{image_file[-16:]}]")
+
+        # Corr 3 with 2
+        if 'q3_q2' not in skip and amp in (4, 2):
+            image_data[0:2056, 2101:4202], array_2 = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_2, type1_pixels_2, v, plot_flag, q2, q3, logger, shifter_value=0, loc = "3_2", axis=1)
+            
+            region = ct_mask[0:2056, 2101:4202]
+            updated_region = np.where(array_2 != 0, array_2, region)
+            ct_mask[0:2056, 2101:4202] = updated_region
+            logger.info(f"{THIS} Correction to Q3 with Q2 Done!! [{image_file[-16:]}]")
+
+        # Corr 2 with 1
+        if 'q2_q1' not in skip and amp == 4:
+            image_data[0:2056, 0:2101], ct_mask[0:2056, 0:2101] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q2, logger, shifter_value=0, loc = "2_1", axis=0)
+            logger.info(f"{THIS} Correction to Q2 with Q1 Done!! [{image_file[-16:]}]")
+
+        # Corr 1 with 2
+        if 'q1_q2' not in skip and amp == 4:
+            image_data[2056:4112, 0:2101], ct_mask[2056:4112, 0:2101] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_2, type1_pixels_2, v, plot_flag, q2, q1, logger, shifter_value=0, loc = "1_2", axis=0)
+            logger.info(f"{THIS} Correction to Q1 with Q2 Done!! [{image_file[-16:]}]")
+    
+
+    # Save results
+    corrected_file_name = image_file.replace("o.fits", "oc.fits")
+    #save_fits_images(image_data, corrected_file_name)
+    save_multi_extension_fits(image_data, ct_mask, corrected_file_name, logger)
+
+    end_time = time.time()
+    duration = end_time - start_time
+    logger.info(f"{THIS} Processing completed in {duration:.2f} seconds. [{image_file[-16:]}]")
+
+# --------------------------------------------------- #
+#              Command Line Interface                 #
+# --------------------------------------------------- #
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Process Veloce FITS files to either apply, or calibrate for, inter-quadrant cross-talk corrections."
+    )
+    parser.add_argument('-p', action='store_true', help="Enable diagnostic plotting and printing.")
+    parser.add_argument('-l', type=str, default=None, help="Path to a text file listing filenames to process.")
+    parser.add_argument('-v', default=False, action='store_true', help="Be more verbose in logging.")
+    parser.add_argument('-cal', default=False, action='store_true', help="Calibrate to create new correction coefficients.")
+    parser.add_argument('--mask1_threshold', type=int, default=6000, help="Threshold for Mask 1.")
+    parser.add_argument('--mask2_threshold', type=int, default=4000, help="Threshold for Mask 2.")
+    parser.add_argument('--q4_q1_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q4 from Q1.")
+    parser.add_argument('--q4_q2_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q4 from Q2.")
+    parser.add_argument('--q3_q2_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q3 from Q2.")
+    parser.add_argument('--q3_q1_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q3 from Q1.")
+    parser.add_argument('--q2_q1_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q2 from Q1.")
+    parser.add_argument('--q1_q2_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q1 from Q2.")
+    parser.add_argument('--skip', type=str, default='', help="Comma-separated list of corrections to skip, e.g. q1_q2,q2_q1,q3_q1.")
+    parser.add_argument('files', nargs='*', help="A directory, glob expression, or filenames to process.")
+    args = parser.parse_args()
+
+    temp_log_dir = os.path.abspath(f"temp_logs_{os.getpid()}")
+    os.makedirs(temp_log_dir, exist_ok=True)
+    
+    # Set up main logger
+    main_log_file = os.path.join(temp_log_dir, f"log_main_{os.getpid()}.log")
+    logger = setup_logger(main_log_file)
+       
+    def parse_log_timestamp(line):
+        """Extract datetime object from log line assuming format: 'YYYY-MM-DD HH:MM:SS,mmm ...'"""
+        match = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)', line)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S,%f")
+            except ValueError:
+                pass
+        return None  # Unsortable line
+    
+    try:
+        # Parse and validate inputs
+        coeff_names = ['q4_q1', 'q4_q2', 'q3_q2', 'q3_q1', 'q2_q1', 'q1_q2']
+        for name in coeff_names:
+            val = getattr(args, f"{name}_cfs")
+            setattr(args, f"{name}_cfs", literal_eval(val))
+
+        args.skip = [tok for tok in args.skip.split(',') if tok]
+
+        if args.l:
+            files_to_process = get_files_from_input([args.l], True, logger)
+        else:
+            files_to_process = get_files_from_input(args.files, False, logger)
+
+        if not files_to_process:
+            logger.info(f"{THIS} No valid 'o.fits' files found in {args.files}")
+            return
+
+        logger.info(f"{THIS} Skipping corrections: {args.skip}")
+        logger.info(f"{THIS} Processing files: {files_to_process}")
+
+        MAX_FILES_AT_A_TIME = get_optimal_max_files()
+        logger.info(f"{THIS} Optimal MAX_FILES_AT_A_TIME: {MAX_FILES_AT_A_TIME}")
+
+        # Pass log_dir to subprocesses
+        temp_log_dir = process_files_in_batches(files_to_process, args, log_dir=temp_log_dir)
+    
+    except Exception:
+        logger.exception("An error occurred during processing.")
+
+    finally:
+        # ---- Always run this: combine + clean up ----
+        try:
+            all_log_lines = []
+            for fname in os.listdir(temp_log_dir):
+                fpath = os.path.join(temp_log_dir, fname)
+                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        ts = parse_log_timestamp(line)
+                        all_log_lines.append((ts, line))
+
+            all_log_lines.sort(key=lambda x: (x[0] is None, x[0]))
+
+            final_log = get_timestamped_log_name()
+            with open(final_log, 'w', encoding='utf-8') as fout:
+                for _, line in all_log_lines:
+                    fout.write(line)
+
+            logger.info(f"Combined logs written to {final_log}")
+        except Exception as e:
+            print(f"Failed to merge logs: {e}", file=sys.stderr)
+
+        # Cleanup
+        def force_remove(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+                func(path)
+            except Exception as inner_e:
+                print(f"Failed to delete {path}: {inner_e}", file=sys.stderr)
+
+        try:
+            shutil.rmtree(temp_log_dir, onerror=force_remove)
+            if os.path.exists(temp_log_dir):
+                print(f"Warning: {temp_log_dir} still exists after shutil.rmtree. Attempting rm -rf...", file=sys.stderr)
+                subprocess.run(["rm", "-rf", temp_log_dir])
+                if os.path.exists(temp_log_dir):
+                    print(f"ERROR: Could not delete {temp_log_dir} even with rm -rf", file=sys.stderr)
+                else:
+                    print(f"Deleted {temp_log_dir} using rm -rf")
+            else:
+                print(f"Deleted {temp_log_dir}")
+        except Exception as e:
+            print(f"Final cleanup failed: {e}", file=sys.stderr)
+            
+# Restore stderr
+sys.stderr = sys.__stderr__
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        logging.exception("Unhandled exception:")
+        sys.exit(1)
