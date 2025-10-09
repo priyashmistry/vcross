@@ -1,3 +1,5 @@
+# VeloceDR Correction Pipeline Documentation
+
 # Correction Pipeline Documentation
 Our script is written in `Python`. It contains several functions, each designed to perform a specific task. The details of each function, including its purpose and the arguments it requires, are provided below.
 
